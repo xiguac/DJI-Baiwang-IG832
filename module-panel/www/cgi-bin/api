@@ -1,0 +1,1297 @@
+#!/bin/sh
+
+ROOT=/data/module-panel
+TOKEN_FILE="$ROOT/token"
+LOG="$ROOT/panel.log"
+ATDEV=/dev/smd9
+POST_DATA=
+CACHE="$ROOT/status.cache"
+LOCKDIR="/tmp/module_panel_at.lock"
+SMSDB="$ROOT/sms.db"
+PIN_FILE="$ROOT/sim.pin"
+
+if [ "${REQUEST_METHOD:-GET}" = "POST" ]; then
+  read -r POST_DATA
+fi
+
+decode() {
+  busybox httpd -d "$1" 2>/dev/null
+}
+
+get_param() {
+  key="$1"
+  data="$QUERY_STRING&$POST_DATA"
+  oldifs="$IFS"
+  IFS='&'
+  for pair in $data; do
+    IFS="$oldifs"
+    k="${pair%%=*}"
+    v="${pair#*=}"
+    if [ "$k" = "$key" ]; then
+      decode "$v"
+      return
+    fi
+    IFS='&'
+  done
+  IFS="$oldifs"
+}
+
+# ---- JSON helpers -----------------------------------------------------
+# json_escape: reads stdin, escapes backslash/quote, joins multiple input
+# lines with a literal \n so the result is safe to drop inside one JSON
+# string. Does not add surrounding quotes.
+json_escape() {
+  awk '
+    { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }
+  '
+}
+
+# json_error: used ONLY before the response headers have been written
+# (currently just require_token). Sends a real HTTP status line.
+json_error() {
+  status="$1"
+  code="$2"
+  message="$3"
+  echo "Status: $status"
+  echo "Content-Type: application/json; charset=utf-8"
+  echo "Cache-Control: no-store"
+  echo
+  printf '{"error":{"code":"%s","message":"%s"}}' \
+    "$(printf '%s' "$code" | json_escape)" "$(printf '%s' "$message" | json_escape)"
+  exit 0
+}
+
+# json_fail: used INSIDE the action dispatch, after the 200 header block
+# has already been written unconditionally. Only the body can still
+# change, so this is an HTTP-200 response whose body carries {"error":...}.
+json_fail() {
+  code="$1"
+  message="$2"
+  printf '{"error":{"code":"%s","message":"%s"}}' \
+    "$(printf '%s' "$code" | json_escape)" "$(printf '%s' "$message" | json_escape)"
+  exit 0
+}
+
+# json_text_ok: wraps whatever plain-text the wrapped command printed on
+# stdin as {"ok":true,"output":"..."} for the handful of admin/debug
+# actions that don't need dedicated field parsing.
+json_text_ok() {
+  out="$(cat)"
+  printf '{"ok":true,"output":"%s"}' "$(printf '%s\n' "$out" | json_escape)"
+}
+
+require_token() {
+  supplied="$(get_param token)"
+  expected="$(cat "$TOKEN_FILE" 2>/dev/null)"
+  if [ -z "$expected" ] || [ "$supplied" != "$expected" ]; then
+    json_error "403 Forbidden" "invalid_token" "token invalid"
+  fi
+}
+
+token_shift() {
+  token="$1"
+  printf '%s' "$token" | od -An -tu1 | awk '{for (i = 1; i <= NF; i++) s += $i} END {print s % 65}'
+}
+
+encrypt_for_token() {
+  token="$(cat "$TOKEN_FILE" 2>/dev/null)"
+  shift="$(token_shift "$token")"
+  tmp="/tmp/module_panel_prefetch_$$"
+  system_snapshot > "$tmp"
+  printf 'MPENC1\n'
+  base64 < "$tmp" | tr -d '\n' | awk -v s="$shift" '
+    BEGIN { a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="; n = length(a) }
+    {
+      out = ""
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        p = index(a, c)
+        if (p > 0) {
+          np = ((p - 1 + s) % n) + 1
+          out = out substr(a, np, 1)
+        } else {
+          out = out c
+        }
+      }
+      print out
+    }'
+  rm -f "$tmp"
+}
+
+at_send() {
+  cmd="$1"
+  case "$cmd" in
+    AT*) ;;
+    *) printf 'rejected: command must start with AT\n'; return 1 ;;
+  esac
+  case "$cmd" in
+    *'
+'*|*'
+'*) printf 'rejected: one line only\n'; return 1 ;;
+  esac
+  if [ ${#cmd} -gt 160 ]; then
+    printf 'rejected: command too long\n'
+    return 1
+  fi
+
+  acquire_at_lock || {
+    printf 'AT port busy, try again\n'
+    return 1
+  }
+  base="/tmp/module_panel_at_$$"
+  out="$base.out"
+  pidfile="$base.pid"
+  rm -f "$out" "$pidfile"
+  stty -F "$ATDEV" 115200 raw -echo -echoe -echok 2>/dev/null || true
+  flush_at_input
+  ( cat "$ATDEV" > "$out" 2>/dev/null & echo $! > "$pidfile" )
+  sleep 0.12
+  printf '%s\r' "$cmd" > "$ATDEV" 2>/dev/null || true
+  # Optional 2nd arg: wait budget in 50ms ticks (default 60 = 3s). Slow commands
+  # such as AT+COPS=? / AT+COPS=1,... pass a larger value.
+  at_wait_reply "$out" "${2:-60}"
+  sleep 0.05
+  kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+  printf '>>> %s\n' "$cmd"
+  emit_at_output "$out"
+  cache_at_output "$cmd" /tmp/module_panel_last_at_$$
+  rm -f /tmp/module_panel_last_at_$$
+  rm -f "$out" "$pidfile"
+  release_at_lock
+}
+
+acquire_at_lock() {
+  i=0
+  while ! mkdir "$LOCKDIR" 2>/dev/null; do
+    oldpid="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && ! kill -0 "$oldpid" 2>/dev/null; then
+      rm -rf "$LOCKDIR" 2>/dev/null || true
+      continue
+    fi
+    i=$((i + 1))
+    [ "$i" -gt 100 ] && return 1
+    sleep 0.25
+  done
+  echo "$$" > "$LOCKDIR/pid"
+  return 0
+}
+
+release_at_lock() {
+  rm -rf "$LOCKDIR" 2>/dev/null || true
+}
+
+
+# Drain the AT port until it's actually quiet, not just for a fixed window.
+# Why: every AT interaction below ends by kill -9'ing its capture process -
+# that stops US reading, but if the modem was still mid-transmission at that
+# instant, the remaining bytes stay queued in the kernel's tty input buffer
+# (nothing is lost) and get handed to whoever reads the device NEXT,
+# regardless of what command they actually sent. This showed up as "sent
+# command A, got command B's response" - confirmed by direct testing to get
+# worse after a busy exchange (e.g. the SMS poller's AT+CMGL across three
+# message stores, which can leave a lot of unread trailing data if its own
+# capture window ended a moment before the modem finished sending). A single
+# fixed-length flush only clears a backlog smaller than that window; this
+# instead watches the flush file's size and keeps draining until it stops
+# growing, with a hard cap so a truly wedged port can't hang a request
+# forever.
+flush_at_input() {
+  flush="/tmp/module_panel_flush_$$"
+  pidfile="/tmp/module_panel_flush_$$.pid"
+  rm -f "$flush" "$pidfile"
+  ( cat "$ATDEV" > "$flush" 2>/dev/null & echo $! > "$pidfile" )
+  quiet=0
+  elapsed=0
+  last_size=-1
+  while [ "$quiet" -lt 4 ] && [ "$elapsed" -lt 40 ]; do
+    sleep 0.1
+    elapsed=$((elapsed + 1))
+    size="$(wc -c < "$flush" 2>/dev/null | tr -d ' ')"
+    [ -n "$size" ] || size=0
+    if [ "$size" = "$last_size" ]; then
+      quiet=$((quiet + 1))
+    else
+      quiet=0
+      last_size="$size"
+    fi
+  done
+  kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+  rm -f "$flush" "$pidfile"
+}
+
+# Wait until a final AT status line shows up in the capture file, or timeout.
+# $1 = capture file, $2 = max iterations of 0.05s (default 60 = ~3s).
+at_wait_reply() {
+  f="$1"
+  max="${2:-60}"
+  i=0
+  while [ "$i" -lt "$max" ]; do
+    if tr '\r' '\n' < "$f" 2>/dev/null | grep -qE '^(OK|ERROR|\+CME ERROR:|\+CMS ERROR:|>)'; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.05
+  done
+  return 1
+}
+
+emit_at_output() {
+  file="$1"
+  tr '\r' '\n' < "$file" 2>/dev/null | sed '/^$/d' | tee /tmp/module_panel_last_at_$$
+}
+
+cache_at_output() {
+  cmd="$1"
+  file="$2"
+  [ -f "$file" ] || return 0
+  {
+    case "$cmd" in
+      AT+CIMI)
+        grep -E '^460[0-9]{12}$' "$file" | tail -1 | awk '{print "+SYSIMSI: " $0}'
+        ;;
+      AT+CGSN)
+        grep -E '^[0-9]{15}$' "$file" | grep -v '^460' | tail -1 | awk '{print "+SYSIMEI: " $0}'
+        ;;
+      AT+CGMM)
+        awk '/^[A-Za-z0-9_-]+$/ && $0 !~ /^AT/ && $0 !~ /^OK$/ {print "+SYSATMODEL: " $0}' "$file" | tail -1
+        ;;
+      AT+CGMR)
+        awk '/^[A-Za-z0-9_.-]+$/ && $0 !~ /^AT/ && $0 !~ /^OK$/ {print "+SYSATREV: " $0}' "$file" | tail -1
+        ;;
+    esac
+    grep '^\+QCCID:' "$file" | tail -1 | sed 's/+QCCID:/+SYSICCID:/'
+    grep '^\+QNWINFO:' "$file" | tail -1
+    grep '^\+QENG: "servingcell"' "$file" | tail -1
+    grep '^\+CPIN:' "$file" | tail -1
+    grep '^\+COPS:' "$file" | tail -1
+    grep '^\+CGDCONT:' "$file" | head -1
+  } >> "$CACHE.tmp" 2>/dev/null || true
+  if [ -s "$CACHE.tmp" ]; then
+    { [ -s "$CACHE" ] && cat "$CACHE"; cat "$CACHE.tmp"; } | awk '!seen[$0]++' | tail -120 > "$CACHE.new"
+    mv "$CACHE.new" "$CACHE"
+    rm -f "$CACHE.tmp"
+  fi
+}
+
+at_send_wait() {
+  cmd="$1"
+  wait="$2"
+  acquire_at_lock || {
+    printf 'AT port busy, try again\n'
+    return 1
+  }
+  base="/tmp/module_panel_atw_$$"
+  out="$base.out"
+  pidfile="$base.pid"
+  rm -f "$out" "$pidfile"
+  stty -F "$ATDEV" 115200 raw -echo -echoe -echok 2>/dev/null || true
+  flush_at_input
+  ( cat "$ATDEV" > "$out" 2>/dev/null & echo $! > "$pidfile" )
+  sleep 0.12
+  printf '%s\r' "$cmd" > "$ATDEV" 2>/dev/null || true
+  at_wait_reply "$out" "$(awk "BEGIN{print int($wait*20)}")"
+  sleep 0.05
+  kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+  printf '>>> %s\n' "$cmd"
+  emit_at_output "$out"
+  cache_at_output "$cmd" /tmp/module_panel_last_at_$$
+  rm -f /tmp/module_panel_last_at_$$
+  rm -f "$out" "$pidfile"
+  release_at_lock
+}
+
+# Run several AT commands back-to-back in a single locked session (one stty/flush/
+# capture-process instead of one per command). Each arg is "CMD" or "CMD::MAXWAIT"
+# (MAXWAIT = iterations of 0.05s, default 60 = ~3s). Output format matches at_send.
+at_batch() {
+  acquire_at_lock || {
+    printf 'AT port busy, try again\n'
+    return 1
+  }
+  base="/tmp/module_panel_batch_$$"
+  out="$base.out"
+  pidfile="$base.pid"
+  rm -f "$out" "$pidfile"
+  stty -F "$ATDEV" 115200 raw -echo -echoe -echok 2>/dev/null || true
+  flush_at_input
+  ( cat "$ATDEV" > "$out" 2>/dev/null & echo $! > "$pidfile" )
+  sleep 0.12
+  offset=0
+  for spec in "$@"; do
+    cmd="${spec%%::*}"
+    maxwait="${spec#*::}"
+    [ "$maxwait" = "$spec" ] && maxwait=60
+    printf '%s\r' "$cmd" > "$ATDEV" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt "$maxwait" ]; do
+      if tail -c "+$((offset + 1))" "$out" 2>/dev/null | tr '\r' '\n' | grep -qE '^(OK|ERROR|\+CME ERROR:|\+CMS ERROR:|>)'; then
+        break
+      fi
+      i=$((i + 1))
+      sleep 0.05
+    done
+    sleep 0.05
+    newoffset="$(wc -c < "$out" 2>/dev/null | tr -d ' ')"
+    [ -n "$newoffset" ] || newoffset="$offset"
+    segfile="$base.seg"
+    tail -c "+$((offset + 1))" "$out" 2>/dev/null > "$segfile"
+    offset="$newoffset"
+    printf '>>> %s\n' "$cmd"
+    tr '\r' '\n' < "$segfile" | sed '/^$/d' | tee /tmp/module_panel_last_at_$$
+    cache_at_output "$cmd" /tmp/module_panel_last_at_$$
+    rm -f /tmp/module_panel_last_at_$$ "$segfile"
+  done
+  kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+  rm -f "$out" "$pidfile"
+  release_at_lock
+}
+
+at_sms_send() {
+  number="$1"
+  message="$2"
+  case "$number" in
+    +[0-9]*|[0-9]*) ;;
+    *) printf 'invalid number\n'; return 1 ;;
+  esac
+  if [ -z "$message" ] || [ ${#message} -gt 140 ]; then
+    printf 'message length must be 1-140\n'
+    return 1
+  fi
+  acquire_at_lock || {
+    printf 'AT port busy, try again\n'
+    return 1
+  }
+  base="/tmp/module_panel_sms_$$"
+  out="$base.out"
+  pidfile="$base.pid"
+  rm -f "$out" "$pidfile"
+  stty -F "$ATDEV" 115200 raw -echo -echoe -echok 2>/dev/null || true
+  flush_at_input
+  ( cat "$ATDEV" > "$out" 2>/dev/null & echo $! > "$pidfile" )
+  sleep 0.1
+  printf 'AT+CMGF=1\r' > "$ATDEV"
+  sleep 0.8
+  printf 'AT+CSCS="GSM"\r' > "$ATDEV"
+  sleep 0.8
+  # at_sms_send_ucs2 leaves CSMP dcs=8 behind; a GSM-text send under dcs=8 fails
+  # with "+CMS ERROR: invalid text mode parameter", so reset dcs to 0 every time.
+  printf 'AT+CSMP=17,167,0,0\r' > "$ATDEV"
+  sleep 0.7
+  printf 'AT+CMGS="%s"\r' "$number" > "$ATDEV"
+  i=0
+  while [ "$i" -lt 40 ]; do
+    tr '\r' '\n' < "$out" 2>/dev/null | grep -q '>' && break
+    tr '\r' '\n' < "$out" 2>/dev/null | grep -q 'ERROR' && break
+    i=$((i + 1))
+    sleep 0.25
+  done
+  if ! tr '\r' '\n' < "$out" 2>/dev/null | grep -q '>'; then
+    kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+    tr '\r' '\n' < "$out" 2>/dev/null | sed '/^$/d'
+    echo "SMS prompt not received"
+    rm -f "$out" "$pidfile"
+    release_at_lock
+    return 1
+  fi
+  printf '%s\032' "$message" > "$ATDEV"
+  i=0
+  while [ "$i" -lt 120 ]; do
+    normalized="$(tr '\r' '\n' < "$out" 2>/dev/null)"
+    echo "$normalized" | grep -q '+CMGS:' && break
+    echo "$normalized" | grep -q 'ERROR' && break
+    i=$((i + 1))
+    sleep 0.5
+  done
+  kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+  tr '\r' '\n' < "$out" 2>/dev/null | sed '/^$/d'
+  rm -f "$out" "$pidfile"
+  release_at_lock
+}
+
+at_sms_send_ucs2() {
+  number_hex="$1"
+  message_hex="$2"
+  case "$number_hex" in *[!0-9A-Fa-f]*|"") printf 'invalid number hex\n'; return 1 ;; esac
+  case "$message_hex" in *[!0-9A-Fa-f]*|"") printf 'invalid message hex\n'; return 1 ;; esac
+  if [ ${#message_hex} -gt 536 ]; then
+    printf 'message too long for UCS2 single SMS\n'
+    return 1
+  fi
+  acquire_at_lock || {
+    printf 'AT port busy, try again\n'
+    return 1
+  }
+  base="/tmp/module_panel_sms_ucs2_$$"
+  out="$base.out"
+  pidfile="$base.pid"
+  rm -f "$out" "$pidfile"
+  stty -F "$ATDEV" 115200 raw -echo -echoe -echok 2>/dev/null || true
+  flush_at_input
+  ( cat "$ATDEV" > "$out" 2>/dev/null & echo $! > "$pidfile" )
+  sleep 0.1
+  printf 'AT+CMGF=1\r' > "$ATDEV"
+  sleep 0.7
+  printf 'AT+CSCS="UCS2"\r' > "$ATDEV"
+  sleep 0.7
+  printf 'AT+CSMP=17,167,0,8\r' > "$ATDEV"
+  sleep 0.7
+  printf 'AT+CMGS="%s"\r' "$number_hex" > "$ATDEV"
+  i=0
+  while [ "$i" -lt 40 ]; do
+    tr '\r' '\n' < "$out" 2>/dev/null | grep -q '>' && break
+    tr '\r' '\n' < "$out" 2>/dev/null | grep -q 'ERROR' && break
+    i=$((i + 1))
+    sleep 0.25
+  done
+  if ! tr '\r' '\n' < "$out" 2>/dev/null | grep -q '>'; then
+    kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+    tr '\r' '\n' < "$out" 2>/dev/null | sed '/^$/d'
+    echo "SMS prompt not received"
+    rm -f "$out" "$pidfile"
+    release_at_lock
+    return 1
+  fi
+  printf '%s\032' "$message_hex" > "$ATDEV"
+  i=0
+  while [ "$i" -lt 120 ]; do
+    normalized="$(tr '\r' '\n' < "$out" 2>/dev/null)"
+    echo "$normalized" | grep -q '+CMGS:' && break
+    echo "$normalized" | grep -q 'ERROR' && break
+    i=$((i + 1))
+    sleep 0.5
+  done
+  kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+  tr '\r' '\n' < "$out" 2>/dev/null | sed '/^$/d'
+  rm -f "$out" "$pidfile"
+  release_at_lock
+}
+
+sms_parse_raw() {
+  # $1 = which store (SM/ME/MT) this AT+CMGL dump came from - recorded as a
+  # 6th column so sms-delete can later select the SAME store before
+  # AT+CMGD. Each store has its own independent index numbering (SM index 0
+  # and ME index 0 are different messages) - deleting without knowing which
+  # store an id actually came from can target the wrong message once SIM
+  # storage is ever used (this SIM currently has 0 messages in SM, so it's
+  # not visible today, but it's a real latent bug otherwise).
+  store="$1"
+  awk -v store="$store" '
+    function flush_msg() {
+      if (idx != "") {
+        gsub(/\t/, " ", body)
+        print idx "\t" status "\t" sender "\t" stamp "\t" body "\t" store
+      }
+      idx=status=sender=stamp=body=""
+    }
+    /^\+CMGL:/ {
+      flush_msg()
+      line=$0
+      sub(/^\+CMGL:[ ]*/, "", line)
+      n=split(line, parts, ",")
+      idx=parts[1]
+      status=parts[2]
+      sender=parts[3]
+      stamp=parts[n]
+      gsub(/^"|"$/, "", status)
+      gsub(/^"|"$/, "", sender)
+      gsub(/^"|"$/, "", stamp)
+      next
+    }
+    idx != "" && $0 !~ /^AT/ && $0 !~ /^OK$/ && $0 !~ /^>>>/ && $0 !~ /^\+/ {
+      body = body ? body "\n" $0 : $0
+      next
+    }
+    END { flush_msg() }
+  '
+}
+
+sms_sync() {
+  tmp="/tmp/module_panel_sms_sync_$$"
+  : > "$tmp"
+  at_batch 'AT+CMGF=1' 'AT+CSCS="GSM"' 'AT+CPMS="SM","SM","SM"' 'AT+CMGL="ALL"::80' 2>/dev/null | sms_parse_raw SM >> "$tmp" || true
+  for store in ME MT; do
+    at_batch "AT+CPMS=\"$store\",\"$store\",\"$store\"" 'AT+CMGL="ALL"::80' 2>/dev/null | sms_parse_raw "$store" >> "$tmp" || true
+  done
+  if [ -s "$tmp" ]; then
+    { [ -s "$SMSDB" ] && cat "$SMSDB"; cat "$tmp"; } | awk -F '\t' '!seen[$3 FS $4 FS $5]++' > "$SMSDB.new"
+    mv "$SMSDB.new" "$SMSDB"
+  fi
+  rm -f "$tmp"
+  touch "$SMSDB"
+}
+
+traffic_snapshot() {
+  awk '
+    $1 ~ /^(bridge0|rndis0|rmnet_data0):$/ {
+      iface=$1
+      sub(/:/, "", iface)
+      printf "%s rx=%s tx=%s\n", iface, $2, $10
+    }
+  ' /proc/net/dev
+}
+
+system_snapshot() {
+  uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null)"
+  ip_addr="$(ip addr show rmnet_data0 2>/dev/null | awk '/ inet / {print $2; exit}')"
+  dns="$(awk '/^nameserver/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)"
+  model="$(awk -F: '/Project Name/ {gsub(/^ +| +$/, "", $2); print $2; exit}' /etc/quectel-project-version 2>/dev/null)"
+  rev="$(awk -F: '/Project Rev/ {gsub(/^ +| +$/, "", $2); print $2; exit}' /etc/quectel-project-version 2>/dev/null)"
+  subrev="$(awk -F: '/Project Sub Rev/ {gsub(/^ +| +$/, "", $2); print $2; exit}' /etc/quectel-project-subversion 2>/dev/null)"
+  printf '+SYSUPTIME: %s\n' "$uptime_s"
+  printf '+SYSIP: %s\n' "${ip_addr:--}"
+  printf '+SYSDNS: %s\n' "${dns:--}"
+  printf '+SYSMODEL: %s\n' "${model:--}"
+  printf '+SYSREV: %s\n' "${subrev:-$rev}"
+  [ -s "$CACHE" ] && cat "$CACHE"
+}
+
+valid_dns_list() {
+  for dns_ip in "$@"; do
+    [ -n "$dns_ip" ] || continue
+    case "$dns_ip" in
+      *[!0-9.]*|*.*.*.*.*|.*|*.) return 1 ;;
+      *) ;;
+    esac
+  done
+  return 0
+}
+
+set_apn() {
+  apn="$1"
+  iptype="$2"
+  [ -n "$iptype" ] || iptype="IPV4V6"
+  case "$apn" in
+    ""|*[!A-Za-z0-9._-]*)
+      echo "invalid apn"
+      return 1
+      ;;
+  esac
+  case "$iptype" in
+    IP|IPV4V6|IPV6) ;;
+    *) iptype="IPV4V6" ;;
+  esac
+  at_send "AT+CGDCONT=1,\"$iptype\",\"$apn\""
+}
+
+lte_lock() {
+  earfcn="$1"
+  pci="$2"
+  case "$earfcn" in *[!0-9]*|"") echo "invalid earfcn"; return 1 ;; esac
+  case "$pci" in *[!0-9]*|"") echo "invalid pci"; return 1 ;; esac
+  at_send "AT+QNWLOCK=\"common/4g\",1,$earfcn,$pci"
+}
+
+# status_bundle: unchanged AT commands, PLUS AT+CSQ / AT+CREG? / AT+CEREG?
+# appended so the JSON status view can show signal + registration (none of
+# these were queried before; all are confirmed supported on this firmware,
+# see device-backups/dji-4g-at-dump-20260706-211926.txt). CREG is the
+# circuit-switched (voice/legacy-SMS) registration; CEREG is the
+# packet-switched/LTE registration that actually matters for a data+SMS-only
+# device. A VoLTE-only SIM (e.g. 中国广电/CBN) is routinely CREG-denied while
+# still being fully registered and working on CEREG - see emit_status_json.
+status_bundle() {
+  at_batch 'AT+CPIN?' 'AT+CIMI' 'AT+QCCID' 'AT+CGSN' 'AT+COPS=3,2' 'AT+COPS?' \
+    'AT+CGDCONT?' 'AT+QNWINFO' 'AT+QENG="servingcell"::36' 'AT+CSQ' 'AT+CREG?' 'AT+CEREG?' \
+    'AT+QCFG="usbnet"?' 'AT+QCFG="usbcfg"?'
+  echo
+  system_snapshot
+}
+
+# ---- JSON emitters for the trimmed frontend ---------------------------
+
+emit_status_json() {
+  tmp="/tmp/module_panel_status_$$"
+  status_bundle > "$tmp" 2>/dev/null
+  # See the matching comment in emit_scan_json: a background vendor query
+  # sharing this port can occasionally crowd out the +QENG:"servingcell"
+  # line. Retry just that one query if it's missing rather than redoing the
+  # whole (much larger) status_bundle batch.
+  attempt=1
+  while [ "$attempt" -le 3 ] && ! grep -q '^\+QENG: "servingcell"' "$tmp" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    sleep 1
+    at_batch 'AT+QENG="servingcell"::24' >> "$tmp" 2>/dev/null
+  done
+  awk '
+    function jesc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+    function jstr(s) { return "\"" jesc(s) "\"" }
+    /^\+CPIN:/ { v=$0; sub(/^\+CPIN:[ ]*/, "", v); sim_state=v }
+    /^\+SYSICCID:/ || /^\+QCCID:/ { v=$0; sub(/^[^:]+:[ ]*/, "", v); gsub(/^ +/, "", v); iccid=v }
+    /^\+SYSIMSI:/ { v=$0; sub(/^\+SYSIMSI:[ ]*/, "", v); imsi=v }
+    $0 ~ /^460[0-9]{12}$/ { imsi=$0 }
+    $0 ~ /^[0-9]{15}$/ && $0 !~ /^460/ { imei=$0 }
+    /^\+COPS:/ {
+      line=$0; sub(/^\+COPS:[ ]*/, "", line)
+      n=split(line, f, ",")
+      if (n >= 3) { operator=f[3]; gsub(/"/, "", operator) }
+    }
+    /^\+QNWINFO:/ {
+      line=$0; sub(/^\+QNWINFO:[ ]*/, "", line)
+      n=split(line, f, ",")
+      for (i=1;i<=n;i++) gsub(/"/, "", f[i])
+      network_mode=f[1]; plmn=f[2]; radio_band=f[3]; radio_channel=f[4]
+    }
+    /^\+QENG: "servingcell"/ {
+      line=$0; sub(/^\+QENG:[ ]*/, "", line)
+      n=split(line, f, ",")
+      for (i=1;i<=n;i++) gsub(/"/, "", f[i])
+      cell_state=f[2]; rat=f[3]; duplex=f[4]; mcc=f[5]; mnc=f[6]
+      cell_id=f[7]; pci=f[8]; earfcn=f[9]; eng_band=f[10]
+      tac=f[13]; rsrp=f[14]; rsrq=f[15]; eng_rssi=f[16]; sinr=f[17]
+    }
+    /^\+CSQ:/ {
+      line=$0; sub(/^\+CSQ:[ ]*/, "", line)
+      n=split(line, f, ",")
+      csq_rssi=f[1]; csq_ber=f[2]
+    }
+    /^\+CREG:/ {
+      line=$0; sub(/^\+CREG:[ ]*/, "", line)
+      n=split(line, f, ",")
+      creg_stat=f[2]
+    }
+    /^\+CEREG:/ {
+      line=$0; sub(/^\+CEREG:[ ]*/, "", line)
+      n=split(line, f, ",")
+      cereg_stat=f[2]
+    }
+    /^\+SYSUPTIME:/ { v=$0; sub(/^\+SYSUPTIME:[ ]*/, "", v); uptime_s=v }
+    /^\+SYSIP:/ { v=$0; sub(/^\+SYSIP:[ ]*/, "", v); local_ip=v }
+    /^\+SYSDNS:/ { v=$0; sub(/^\+SYSDNS:[ ]*/, "", v); dns=v }
+    /^\+SYSMODEL:/ { v=$0; sub(/^\+SYSMODEL:[ ]*/, "", v); model=v }
+    /^\+SYSREV:/ { v=$0; sub(/^\+SYSREV:[ ]*/, "", v); fw_rev=v }
+    END {
+      printf "{"
+      printf "\"iccid\":%s,", jstr(iccid)
+      printf "\"imsi\":%s,", jstr(imsi)
+      printf "\"imei\":%s,", jstr(imei)
+      printf "\"sim_state\":%s,", jstr(sim_state)
+      printf "\"operator\":%s,", jstr(operator)
+      printf "\"plmn\":%s,", jstr(plmn)
+      printf "\"reg_status\":%s,", jstr(creg_stat)
+      printf "\"reg_status_ps\":%s,", jstr(cereg_stat)
+      printf "\"network_mode\":%s,", jstr(network_mode)
+      printf "\"radio_band\":%s,", jstr(radio_band)
+      printf "\"radio_channel\":%s,", jstr(radio_channel)
+      printf "\"rat\":%s,", jstr(rat)
+      printf "\"duplex\":%s,", jstr(duplex)
+      printf "\"mcc\":%s,", jstr(mcc)
+      printf "\"mnc\":%s,", jstr(mnc)
+      printf "\"cell_id\":%s,", jstr(cell_id)
+      printf "\"pci\":%s,", jstr(pci)
+      printf "\"earfcn\":%s,", jstr(earfcn)
+      printf "\"tac\":%s,", jstr(tac)
+      printf "\"rsrp\":%s,", jstr(rsrp)
+      printf "\"rsrq\":%s,", jstr(rsrq)
+      printf "\"rssi\":%s,", jstr(eng_rssi)
+      printf "\"sinr\":%s,", jstr(sinr)
+      printf "\"csq_rssi\":%s,", jstr(csq_rssi)
+      printf "\"csq_ber\":%s,", jstr(csq_ber)
+      printf "\"uptime_s\":%s,", jstr(uptime_s)
+      printf "\"local_ip\":%s,", jstr(local_ip)
+      printf "\"dns\":%s,", jstr(dns)
+      printf "\"model\":%s,", jstr(model)
+      printf "\"fw_rev\":%s", jstr(fw_rev)
+      printf "}"
+    }
+  ' "$tmp"
+  rm -f "$tmp"
+}
+
+emit_scan_json() {
+  tmp="/tmp/module_panel_scan_$$"
+  at_batch 'AT+QENG="servingcell"::24' 'AT+QENG="neighbourcell"::60' > "$tmp" 2>/dev/null
+  # A background vendor process periodically issues its own AT+CEREG? on this
+  # same shared port (confirmed by direct observation - not something this
+  # panel starts), which occasionally lands in the middle of our capture
+  # window and crowds out the real +QENG:"servingcell" line. Retry a couple
+  # times before giving up - a second attempt has reliably succeeded in
+  # testing.
+  attempt=1
+  while [ "$attempt" -le 3 ] && ! grep -q '^\+QENG: "servingcell"' "$tmp" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    sleep 1
+    at_batch 'AT+QENG="servingcell"::24' > "$tmp" 2>/dev/null
+  done
+  # Neighbour list is nice-to-have, not worth blocking retries on - fetch it
+  # once more up front only if the retry loop above overwrote it.
+  if [ "$attempt" -gt 1 ]; then
+    at_batch 'AT+QENG="neighbourcell"::60' >> "$tmp" 2>/dev/null
+  fi
+  awk '
+    function jesc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+    function jstr(s) { return "\"" jesc(s) "\"" }
+    /^\+QENG: "servingcell"/ {
+      line=$0; sub(/^\+QENG:[ ]*/, "", line)
+      n=split(line, f, ",")
+      for (i=1;i<=n;i++) gsub(/"/, "", f[i])
+      have_serving=1
+      s_state=f[2]; s_rat=f[3]; s_duplex=f[4]; s_mcc=f[5]; s_mnc=f[6]
+      s_cellid=f[7]; s_pci=f[8]; s_earfcn=f[9]; s_band=f[10]
+      s_tac=f[13]; s_rsrp=f[14]; s_rsrq=f[15]; s_rssi=f[16]; s_sinr=f[17]
+    }
+    /^\+QENG: "neighbourcell/ {
+      line=$0; sub(/^\+QENG:[ ]*/, "", line)
+      n=split(line, f, ",")
+      for (i=1;i<=n;i++) gsub(/"/, "", f[i])
+      ntype=f[1]; sub(/^neighbourcell */, "", ntype)
+      entry = entry sprintf("%s{\"type\":%s,\"rat\":%s,\"earfcn\":%s,\"pci\":%s,\"rsrq\":%s,\"rsrp\":%s,\"rssi\":%s,\"sinr\":%s}",
+        (nc > 0 ? "," : ""), jstr(ntype), jstr(f[2]), jstr(f[3]), jstr(f[4]), jstr(f[5]), jstr(f[6]), jstr(f[7]), jstr(f[8]))
+      nc++
+    }
+    END {
+      if (have_serving) {
+        printf "{\"serving\":{\"state\":%s,\"rat\":%s,\"duplex\":%s,\"mcc\":%s,\"mnc\":%s,\"cell_id\":%s,\"pci\":%s,\"earfcn\":%s,\"band\":%s,\"tac\":%s,\"rsrp\":%s,\"rsrq\":%s,\"rssi\":%s,\"sinr\":%s}",
+          jstr(s_state), jstr(s_rat), jstr(s_duplex), jstr(s_mcc), jstr(s_mnc), jstr(s_cellid), jstr(s_pci), jstr(s_earfcn), jstr(s_band), jstr(s_tac), jstr(s_rsrp), jstr(s_rsrq), jstr(s_rssi), jstr(s_sinr)
+      } else {
+        printf "{\"serving\":null"
+      }
+      printf ",\"neighbours\":[%s]}", entry
+    }
+  ' "$tmp"
+  rm -f "$tmp"
+}
+
+emit_sms_list_json() {
+  awk -F '\t' '
+    function jesc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/\r/, "", s); return s }
+    function jstr(s) { return "\"" jesc(s) "\"" }
+    BEGIN { printf "[" }
+    NF >= 5 {
+      if (n++) printf ","
+      printf "{\"id\":%s,\"direction\":%s,\"peer\":%s,\"timestamp\":%s,\"body\":%s}",
+        jstr($1), jstr($2), jstr($3), jstr($4), jstr($5)
+    }
+    END { printf "]" }
+  ' "$SMSDB" 2>/dev/null
+}
+
+# traffic_report: adds an instantaneous-rate + reboot-surviving cumulative
+# layer on top of the existing raw /proc/net/dev counters. Uses awk (double
+# precision) for the running totals, not shell $(( )) integer arithmetic,
+# since monthly cellular traffic can exceed a 32-bit signed counter.
+traffic_report() {
+  now="$(date +%s 2>/dev/null)"
+  raw="$(traffic_snapshot)"
+  prev_file="/tmp/module_panel_traffic_prev"
+  totals_file="$ROOT/traffic_totals"
+  lockdir="/tmp/module_panel_traffic.lock"
+  i=0
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -gt 40 ] && break
+    sleep 0.05
+  done
+  printf '%s\n' "$raw" | awk -v now="$now" -v prev_file="$prev_file" -v totals_file="$totals_file" '
+    function jesc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+    function jstr(s) { return "\"" jesc(s) "\"" }
+    BEGIN {
+      while ((getline pline < prev_file) > 0) {
+        split(pline, pf, "\t")
+        prsx[pf[1]] = pf[2]; ptsx[pf[1]] = pf[3]; ptime[pf[1]] = pf[4]
+      }
+      close(prev_file)
+      while ((getline tline < totals_file) > 0) {
+        split(tline, tf, "\t")
+        crx[tf[1]] = tf[2]; ctx[tf[1]] = tf[3]
+      }
+      close(totals_file)
+    }
+    /^[a-z_0-9]+ rx=/ {
+      iface = $1
+      rx = $2; sub(/rx=/, "", rx)
+      tx = $3; sub(/tx=/, "", tx)
+      ifaces[iface] = 1
+      rxv[iface] = rx; txv[iface] = tx
+    }
+    END {
+      printf "{\"ifaces\":{"
+      first = 1
+      total_rx_bps = 0; total_tx_bps = 0; total_cum_rx = 0; total_cum_tx = 0
+      for (iface in ifaces) {
+        rx = rxv[iface] + 0; tx = txv[iface] + 0
+        have_prev = (iface in ptime)
+        prx = have_prev ? prsx[iface] + 0 : rx
+        ptx = have_prev ? ptsx[iface] + 0 : tx
+        pt = have_prev ? ptime[iface] + 0 : now
+        dt = now - pt; if (dt <= 0) dt = 1
+        drx = rx - prx; dtx = tx - ptx
+        if (drx < 0) drx = 0
+        if (dtx < 0) dtx = 0
+        rx_bps = have_prev ? drx / dt : 0
+        tx_bps = have_prev ? dtx / dt : 0
+        old_crx = (iface in crx) ? crx[iface] + 0 : 0
+        old_ctx = (iface in ctx) ? ctx[iface] + 0 : 0
+        if (rx < prx) { new_crx = old_crx + rx } else { new_crx = old_crx + drx }
+        if (tx < ptx) { new_ctx = old_ctx + tx } else { new_ctx = old_ctx + dtx }
+        if (!first) printf ","
+        printf "%s:{\"rx_bytes\":%d,\"tx_bytes\":%d,\"rx_bps\":%d,\"tx_bps\":%d,\"cum_rx\":%.0f,\"cum_tx\":%.0f}",
+          jstr(iface), rx, tx, rx_bps, tx_bps, new_crx, new_ctx
+        first = 0
+        total_rx_bps += rx_bps; total_tx_bps += tx_bps
+        total_cum_rx += new_crx; total_cum_tx += new_ctx
+        print iface "\t" rx "\t" tx "\t" now > prev_file
+        print iface "\t" new_crx "\t" new_ctx > totals_file
+      }
+      printf "},\"total\":{\"rx_bps\":%d,\"tx_bps\":%d,\"cum_rx\":%.0f,\"cum_tx\":%.0f}}",
+        total_rx_bps, total_tx_bps, total_cum_rx, total_cum_tx
+      close(prev_file)
+      close(totals_file)
+    }
+  '
+  rmdir "$lockdir" 2>/dev/null || true
+}
+
+# ---- USB network mode (RNDIS for PC / ECM for phone) -------------------
+# Only AT+QCFG="usbnet" needs to change between these two - usbcfg (which
+# interfaces exist: ADB/AT/modem/etc) stays the same either way, confirmed
+# by testing on this exact hardware. A change takes effect after
+# AT+CFUN=1,1 - which on THIS firmware is a FULL LINUX REBOOT (confirmed via
+# /proc/uptime dropping to near-zero ~15s after an isolated AT+CFUN=1,1 with
+# no mode change at all), not just a radio/USB-only reset. adb/http drop
+# during it because the whole device is genuinely restarting - this is
+# expected, not a bug, but any caller must assume the CGI process itself
+# will be killed shortly after this returns. See usbmode-auto.sh for how
+# the auto-negotiation script accounts for this (state persisted to flash,
+# never assumes it will still be running after a switch).
+
+usbnet_query_json() {
+  out="$(at_send 'AT+QCFG="usbnet"?')"
+  if printf '%s' "$out" | grep -q '"usbnet",3'; then
+    printf '{"mode":"rndis"}'
+  elif printf '%s' "$out" | grep -q '"usbnet",1'; then
+    printf '{"mode":"ecm"}'
+  else
+    printf '{"mode":"unknown"}'
+  fi
+}
+
+usbnet_set_json() {
+  mode="$1"
+  case "$mode" in
+    rndis) code=3 ;;
+    ecm) code=1 ;;
+    *) json_fail "invalid_mode" "mode must be rndis or ecm" ;;
+  esac
+  cur="$(at_send 'AT+QCFG="usbnet"?')"
+  if printf '%s' "$cur" | grep -q "\"usbnet\",$code"; then
+    printf '{"ok":true,"changed":false}'
+    return 0
+  fi
+  at_send "AT+QCFG=\"usbnet\",$code" >/dev/null 2>&1
+  at_send 'AT+CFUN=1,1' >/dev/null 2>&1
+  printf '{"ok":true,"changed":true}'
+}
+
+# usbmode-auto.sh: on by default (opt-OUT via a flag file). It's a one-shot
+# script that only runs once at boot (this device is bus-powered, so an
+# unplug already cuts power - there's no persistent process to toggle).
+# This flag just controls what the NEXT boot's run does.
+USBAUTO_DISABLE_FLAG="$ROOT/usbmode-auto.disable"
+USBAUTO_STATE="$ROOT/usbmode.state"
+USBAUTO_LOG="$ROOT/usbmode.log"
+
+usbauto_status_json() {
+  enabled="true"
+  [ -f "$USBAUTO_DISABLE_FLAG" ] && enabled="false"
+  last_mode="$(cat "$USBAUTO_STATE" 2>/dev/null)"
+  [ -n "$last_mode" ] || last_mode="null"
+  [ "$last_mode" = "null" ] || last_mode="\"$last_mode\""
+  last_log="$(tail -5 "$USBAUTO_LOG" 2>/dev/null | json_escape)"
+  printf '{"enabled":%s,"last_mode":%s,"log_tail":"%s"}' "$enabled" "$last_mode" "$last_log"
+}
+
+usbauto_enable_json() {
+  rm -f "$USBAUTO_DISABLE_FLAG"
+  printf '{"ok":true}'
+}
+
+usbauto_disable_json() {
+  : > "$USBAUTO_DISABLE_FLAG"
+  printf '{"ok":true}'
+}
+
+# ------------------------------------------------------------------------
+
+action="$(get_param action)"
+echo "$(date '+%F %T') action=$action" >> "$LOG"
+
+if [ "$action" = "prefetch" ]; then
+  echo "Content-Type: text/plain; charset=utf-8"
+  echo "Cache-Control: no-store"
+  echo
+  encrypt_for_token
+  exit 0
+fi
+
+require_token
+
+echo "Content-Type: application/json; charset=utf-8"
+echo "Cache-Control: no-store"
+echo
+
+case "$action" in
+  auth)
+    printf '{"ok":true}'
+    ;;
+  change-token)
+    new_token="$(get_param new_token | tr -d '\r\n')"
+    len="${#new_token}"
+    if [ "$len" -lt 8 ] || [ "$len" -gt 128 ]; then
+      json_fail "invalid_token_length" "new token length must be 8-128"
+    fi
+    case "$new_token" in
+      *' '*|*'	'*)
+        json_fail "invalid_token_chars" "new token must not contain spaces"
+        ;;
+    esac
+    printf '%s\n' "$new_token" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    printf '{"ok":true}'
+    ;;
+  status)
+    emit_status_json
+    ;;
+  at)
+    cmd="$(get_param cmd | tr -d '\r\n')"
+    [ -n "$cmd" ] || json_fail "empty_command" "empty command"
+    at_send "$cmd" | json_text_ok
+    ;;
+  traffic)
+    traffic_report
+    ;;
+  scan-cells)
+    emit_scan_json
+    ;;
+  sms-list)
+    emit_sms_list_json
+    ;;
+  sms-sync)
+    sms_sync
+    printf '{"ok":true}'
+    ;;
+  sms-send)
+    number="$(get_param number | tr -d '\r\n')"
+    message="$(get_param message | tr -d '\r')"
+    number_hex="$(get_param number_hex | tr -d '\r\n ')"
+    message_hex="$(get_param message_hex | tr -d '\r\n ')"
+    if [ -n "$number_hex" ] && [ -n "$message_hex" ]; then
+      send_out="$(at_sms_send_ucs2 "$number_hex" "$message_hex")"
+    else
+      send_out="$(at_sms_send "$number" "$message")"
+    fi
+    if printf '%s' "$send_out" | grep -q '+CMGS:'; then
+      peer="${number:-$number_hex}"
+      body_field="${message_hex:-$message}"
+      stamp="$(date '+%y/%m/%d,%H:%M:%S+00' 2>/dev/null)"
+      printf 'OUT-%s\tOUT\t%s\t%s\t%s\n' "$(date +%s 2>/dev/null)" "$peer" "$stamp" "$body_field" >> "$SMSDB"
+      printf '{"ok":true}'
+    else
+      json_fail "sms_send_failed" "$(printf '%s' "$send_out" | tr '\n' ' ')"
+    fi
+    ;;
+  sms-delete)
+    index="$(get_param index | tr -d '\r\n ')"
+    case "$index" in *[!0-9]*|"") json_fail "invalid_index" "invalid sms index" ;; esac
+    # Use whichever store (SM/ME/MT) this message was actually recorded from
+    # (6th column, added by sms_parse_raw) - SM and ME each have their own
+    # independent index numbering, so always deleting from ME would target
+    # the wrong message once SIM storage is ever used. Rows synced before
+    # this column existed have no 6th field; default those to ME, which
+    # matches this device's actual history (SM has been empty all along).
+    store="$(awk -F '\t' -v idx="$index" '$1 == idx { print ($6 != "" ? $6 : "ME"); exit }' "$SMSDB" 2>/dev/null)"
+    [ -n "$store" ] || store="ME"
+    at_batch 'AT+CMGF=1::20' "AT+CPMS=\"$store\",\"$store\",\"$store\"::20" "AT+CMGD=$index" >/dev/null 2>&1
+    if [ -s "$SMSDB" ]; then
+      awk -F '\t' -v idx="$index" '$1 != idx' "$SMSDB" > "$SMSDB.new" 2>/dev/null && mv "$SMSDB.new" "$SMSDB"
+    fi
+    printf '{"ok":true}'
+    ;;
+  pin-unlock)
+    pin="$(get_param pin | tr -d '\r\n')"
+    case "$pin" in *[!0-9]*|"") json_fail "invalid_pin" "invalid pin" ;; esac
+    # A bare "OK" from AT+CPIN is NOT proof the code was actually checked -
+    # confirmed by testing: this firmware answers OK even when the SIM
+    # isn't PIN-locked at all, since there's nothing to verify against. The
+    # only trustworthy signal is the SIM's own state actually moving to
+    # READY afterward. Getting this wrong would mean saving an unverified
+    # guess, which the boot-time auto-unlock script would later replay
+    # against a SIM that genuinely does need a PIN - burning a real retry
+    # attempt on a wrong code.
+    at_send "AT+CPIN=\"$pin\"" >/dev/null 2>&1
+    sim_state="$(at_send 'AT+CPIN?' | grep '^+CPIN:' | tail -1 | sed 's/^+CPIN:[ ]*//')"
+    if [ "$sim_state" = "READY" ]; then
+      printf '%s\n' "$pin" > "$PIN_FILE"
+      chmod 600 "$PIN_FILE"
+      printf '{"ok":true,"saved":true}'
+    else
+      json_fail "pin_unlock_failed" "SIM state after attempt: ${sim_state:-unknown}"
+    fi
+    ;;
+  pin-forget)
+    rm -f "$PIN_FILE"
+    printf '{"ok":true}'
+    ;;
+  pin-status)
+    saved="false"
+    [ -s "$PIN_FILE" ] && saved="true"
+    raw="$(at_batch 'AT+CPIN?::20' 'AT+QPINC="SC"::20' 2>/dev/null)"
+    sim_state="$(printf '%s\n' "$raw" | grep '^+CPIN:' | tail -1 | sed 's/^+CPIN:[ ]*//')"
+    remaining="$(printf '%s\n' "$raw" | grep '^+QPINC:' | tail -1 | awk -F',' '{gsub(/[^0-9]/,"",$2); print $2}')"
+    [ -n "$remaining" ] || remaining="null"
+    printf '{"pin_saved":%s,"sim_state":"%s","attempts_remaining":%s}' \
+      "$saved" "$(printf '%s' "$sim_state" | json_escape)" "$remaining"
+    ;;
+  apn-query)
+    at_send 'AT+CGDCONT?' | json_text_ok
+    ;;
+  apn-get)
+    cg="$(at_send 'AT+CGDCONT?' | tr -d '\r' | grep '^+CGDCONT: 1,' | head -1)"
+    ap_iptype="$(printf '%s' "$cg" | sed -n 's/^+CGDCONT: 1,"\([^"]*\)","\([^"]*\)".*/\1/p')"
+    ap_apn="$(printf '%s' "$cg" | sed -n 's/^+CGDCONT: 1,"\([^"]*\)","\([^"]*\)".*/\2/p')"
+    ap_auth="$(at_send 'AT$QCPDPP?' | tr -d '\r' | sed -n 's/^\$QCPDPP: 1,\([0-9]*\).*/\1/p' | head -1)"
+    printf '{"apn":"%s","iptype":"%s","auth":%s}' \
+      "$(printf '%s' "$ap_apn" | json_escape)" "$(printf '%s' "$ap_iptype" | json_escape)" "${ap_auth:-null}"
+    ;;
+  apn-set)
+    out="$(set_apn "$(get_param apn | tr -d '\r\n')" "$(get_param iptype | tr -d '\r\n')")"
+    case "$out" in
+      *ERROR*|*"invalid apn"*) json_fail "apn_set_failed" "$(printf '%s' "$out" | tr '\n' ' ')" ;;
+    esac
+    auth_in="$(get_param auth | tr -d '\r\n ')"
+    if [ -n "$auth_in" ]; then
+      case "$auth_in" in 0|1|2|3) ;; *) json_fail "invalid_auth" "auth must be 0-3" ;; esac
+      user_in="$(get_param username | tr -d '\r\n')"
+      pass_in="$(get_param password | tr -d '\r\n')"
+      for v in "$user_in" "$pass_in"; do
+        case "$v" in *[!A-Za-z0-9._@#%+=:/!~-]*) json_fail "invalid_credential" "username/password contain unsupported characters" ;; esac
+        [ ${#v} -le 64 ] || json_fail "invalid_credential" "username/password too long (max 64)"
+      done
+      if [ "$auth_in" = "0" ]; then
+        out2="$(at_send 'AT$QCPDPP=1,0')"
+      else
+        out2="$(at_send "AT\$QCPDPP=1,$auth_in,\"$pass_in\",\"$user_in\"")"
+      fi
+      case "$out2" in
+        *ERROR*) json_fail "auth_set_failed" "$(printf '%s' "$out2" | tr '\n' ' ')" ;;
+      esac
+    fi
+    printf '{"ok":true}'
+    ;;
+  cops-get)
+    out="$(at_send 'AT+COPS?' | tr -d '\r')"
+    cmode="$(printf '%s\n' "$out" | sed -n 's/^+COPS: \([0-9]*\).*/\1/p' | head -1)"
+    cplmn="$(printf '%s\n' "$out" | sed -n 's/^+COPS: [0-9]*,[0-9]*,"\([^"]*\)".*/\1/p' | head -1)"
+    cact="$(printf '%s\n' "$out" | sed -n 's/^+COPS: [0-9]*,[0-9]*,"[^"]*",\([0-9]*\).*/\1/p' | head -1)"
+    printf '{"mode":%s,"plmn":"%s","act":%s}' "${cmode:-null}" "$(printf '%s' "$cplmn" | json_escape)" "${cact:-null}"
+    ;;
+  cops-scan-start)
+    SCAN_STATE=/tmp/cops_scan.state
+    SCAN_OUT=/tmp/cops_scan.out
+    if [ -f "$SCAN_STATE" ] && grep -q '^running' "$SCAN_STATE"; then
+      started="$(cut -d' ' -f2 "$SCAN_STATE")"
+      now="$(date +%s)"
+      if [ -n "$started" ] && [ $((now - started)) -lt 240 ]; then
+        json_fail "scan_running" "a scan is already running"
+      fi
+    fi
+    echo "running $(date +%s)" > "$SCAN_STATE"
+    rm -f "$SCAN_OUT"
+    # Detached: the scan can take minutes and holds the AT port the whole time.
+    (
+      at_send 'AT+COPS=?' 3600 > "$SCAN_OUT.tmp" 2>&1
+      mv "$SCAN_OUT.tmp" "$SCAN_OUT"
+      echo "done $(date +%s)" > "$SCAN_STATE"
+    ) </dev/null >/dev/null 2>&1 &
+    printf '{"ok":true}'
+    ;;
+  cops-scan-result)
+    SCAN_STATE=/tmp/cops_scan.state
+    SCAN_OUT=/tmp/cops_scan.out
+    sstate="idle"
+    if [ -f "$SCAN_STATE" ]; then
+      sstate="$(cut -d' ' -f1 "$SCAN_STATE")"
+      if [ "$sstate" = "running" ]; then
+        started="$(cut -d' ' -f2 "$SCAN_STATE")"
+        now="$(date +%s)"
+        [ -n "$started" ] && [ $((now - started)) -ge 240 ] && sstate="failed"
+      fi
+    fi
+    sraw=""
+    [ -f "$SCAN_OUT" ] && sraw="$(cat "$SCAN_OUT")"
+    printf '{"state":"%s","output":"%s"}' "$sstate" "$(printf '%s\n' "$sraw" | json_escape)"
+    ;;
+  cops-set)
+    cm="$(get_param mode | tr -d '\r\n ')"
+    case "$cm" in
+      auto)
+        out="$(at_send 'AT+COPS=0' 1800)"
+        ;;
+      manual)
+        cp="$(get_param plmn | tr -d '\r\n ')"
+        ca="$(get_param act | tr -d '\r\n ')"
+        case "$cp" in *[!0-9]*|"") json_fail "invalid_plmn" "plmn must be digits" ;; esac
+        [ ${#cp} -ge 5 ] && [ ${#cp} -le 6 ] || json_fail "invalid_plmn" "plmn must be 5-6 digits"
+        case "$ca" in
+          "") out="$(at_send "AT+COPS=1,2,\"$cp\"" 1800)" ;;
+          0|2|7) out="$(at_send "AT+COPS=1,2,\"$cp\",$ca" 1800)" ;;
+          *) json_fail "invalid_act" "act must be 0, 2 or 7" ;;
+        esac
+        ;;
+      *) json_fail "invalid_mode" "mode must be auto or manual" ;;
+    esac
+    if printf '%s' "$out" | grep -q 'OK'; then
+      printf '{"ok":true}'
+    else
+      json_fail "cops_set_failed" "$(printf '%s' "$out" | tr '\n' ' ')"
+    fi
+    ;;
+  band-get)
+    out="$(at_send 'AT+QCFG="band"' | tr -d '\r')"
+    bl="$(printf '%s\n' "$out" | sed -n 's/^+QCFG: "band",[^,]*,0x\([0-9a-fA-F]*\),.*/\1/p' | tail -1)"
+    printf '{"lte":"%s"}' "$bl"
+    ;;
+  band-set)
+    # This module only accepts a 63-bit LTE mask, so B66/B71 cannot be set.
+    BAND_ALL=0x1e20b0e18df
+    bl="$(get_param lte | tr -d '\r\n ')"
+    case "$bl" in ""|*[!0-9a-fA-F]*) json_fail "invalid_band" "lte mask must be hex" ;; esac
+    [ ${#bl} -le 16 ] || json_fail "invalid_band" "lte mask too long"
+    bv=$((0x$bl))
+    [ "$bv" -ne 0 ] || json_fail "invalid_band" "select at least one band"
+    [ $((bv & ~BAND_ALL)) -eq 0 ] || json_fail "invalid_band" "mask contains unsupported bands"
+    out="$(at_send "AT+QCFG=\"band\",0,$bl,0,1")"
+    if printf '%s' "$out" | grep -q 'OK'; then
+      printf '{"ok":true}'
+    else
+      json_fail "band_set_failed" "$(printf '%s' "$out" | tr '\n' ' ')"
+    fi
+    ;;
+  dns-query)
+    system_snapshot | grep '^+SYSDNS:' | json_text_ok
+    ;;
+  dns-set)
+    dns1="$(get_param dns1 | tr -d '\r\n ')"
+    dns2="$(get_param dns2 | tr -d '\r\n ')"
+    if [ -z "$dns1" ]; then
+      json_fail "dns1_required" "dns1 required"
+    fi
+    if ! valid_dns_list "$dns1" "$dns2"; then
+      json_fail "invalid_dns" "invalid dns"
+    fi
+    {
+      echo "$dns1"
+      [ -n "$dns2" ] && echo "$dns2"
+    } > "$ROOT/dns.conf"
+    awk '{print "nameserver " $1}' "$ROOT/dns.conf" > /etc/resolv.conf 2>/dev/null || true
+    system_snapshot | grep '^+SYSDNS:' | json_text_ok
+    ;;
+  cell-lock)
+    earfcn="$(get_param earfcn | tr -d '\r\n')"
+    pci="$(get_param pci | tr -d '\r\n')"
+    case "$earfcn" in *[!0-9]*|"") json_fail "invalid_earfcn" "invalid earfcn" ;; esac
+    case "$pci" in *[!0-9]*|"") json_fail "invalid_pci" "invalid pci" ;; esac
+    out="$(lte_lock "$earfcn" "$pci")"
+    if printf '%s' "$out" | grep -q 'OK'; then
+      printf '{"ok":true}'
+    else
+      json_fail "cell_lock_failed" "$(printf '%s' "$out" | tr '\n' ' ')"
+    fi
+    ;;
+  cell-unlock)
+    out="$(at_send 'AT+QNWLOCK="common/4g",0')"
+    if printf '%s' "$out" | grep -q 'OK'; then
+      printf '{"ok":true}'
+    else
+      json_fail "cell_unlock_failed" "$(printf '%s' "$out" | tr '\n' ' ')"
+    fi
+    ;;
+  usbnet-query)
+    usbnet_query_json
+    ;;
+  usbnet-set)
+    usbnet_set_json "$(get_param mode | tr -d '\r\n')"
+    ;;
+  usbauto-status)
+    usbauto_status_json
+    ;;
+  usbauto-enable)
+    usbauto_enable_json
+    ;;
+  usbauto-disable)
+    usbauto_disable_json
+    ;;
+  net)
+    {
+      echo "### ip addr"
+      ip addr 2>/dev/null
+      echo
+      echo "### route"
+      route -n 2>/dev/null
+      echo
+      echo "### listeners"
+      netstat -lntup 2>/dev/null || netstat -lnt 2>/dev/null
+    } | json_text_ok
+    ;;
+  ping)
+    target="$(get_param target | tr -d '\r\n ')"
+    [ -n "$target" ] || target="baidu.com"
+    case "$target" in
+      *[!A-Za-z0-9.-]*|.*|*.) json_fail "invalid_target" "invalid target" ;;
+    esac
+    {
+      echo "### ping $target"
+      ping -c 4 -W 3 "$target" 2>&1
+      echo
+      echo "### wget http://$target/"
+      wget -O /dev/null -T 10 "http://$target/" 2>&1
+    } | json_text_ok
+    ;;
+  syslog)
+    {
+      echo "### 操作记录 (panel.log，已隐藏轮询类请求)"
+      grep -v -E 'action=(status|traffic|auth|sms-sync|sms-list|usbnet-query|usbauto-status|net-settings|syslog|pin-status|prefetch)$' "$LOG" 2>/dev/null | tail -n 60
+      echo
+      echo "### USB 模式日志 (usbmode.log)"
+      tail -n 20 "$ROOT/usbmode.log" 2>/dev/null
+    } | json_text_ok
+    ;;
+  net-settings)
+    nws="$(at_send 'AT+QCFG="nwscanmode"' | tr -d '\r' | sed -n 's/^+QCFG: "nwscanmode",\([0-9]*\).*/\1/p' | tail -1)"
+    roam="$(at_send 'AT+QCFG="roamservice"' | tr -d '\r' | sed -n 's/^+QCFG: "roamservice",\([0-9]*\).*/\1/p' | tail -1)"
+    ims="$(at_send 'AT+QCFG="ims"' | tr -d '\r' | sed -n 's/^+QCFG: "ims",\([0-9]*\).*/\1/p' | tail -1)"
+    auto="$(at_send 'AT+QCFG="qcautoconnect"' | tr -d '\r' | sed -n 's/^+QCFG: "qcautoconnect",\([0-9]*\).*/\1/p' | tail -1)"
+    printf '{"nwscanmode":%s,"roamservice":%s,"ims":%s,"qcautoconnect":%s}' \
+      "${nws:-null}" "${roam:-null}" "${ims:-null}" "${auto:-null}"
+    ;;
+  net-settings-set)
+    key="$(get_param key | tr -d '\r\n ')"
+    value="$(get_param value | tr -d '\r\n ')"
+    case "$key:$value" in
+      nwscanmode:0|nwscanmode:3|roamservice:1|roamservice:2|roamservice:255|ims:0|ims:1|ims:2|qcautoconnect:0|qcautoconnect:1) ;;
+      *) json_fail "invalid_setting" "unsupported setting or value" ;;
+    esac
+    out="$(at_send "AT+QCFG=\"$key\",$value")"
+    if printf '%s' "$out" | grep -q 'OK'; then
+      printf '{"ok":true}'
+    else
+      json_fail "setting_failed" "$(printf '%s' "$out" | tr '\n' ' ')"
+    fi
+    ;;
+  restore-rndis)
+    {
+      at_send 'AT+QCFG="usbnet",3'
+      echo
+      at_send 'AT+QCFG="usbcfg",0x2C7C,0x0125,1,1,1,1,1,1,0'
+      echo
+      echo 'Configuration written. Replug or reboot if Windows does not refresh.'
+    } | json_text_ok
+    ;;
+  reboot)
+    printf '{"ok":true,"output":"Rebooting now."}'
+    sync
+    reboot
+    ;;
+  *)
+    json_fail "unknown_action" "unknown action: $action"
+    ;;
+esac

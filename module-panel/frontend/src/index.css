@@ -1,0 +1,365 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==========================================================================
+   Structural CSS the Tailwind utility classes alone don't cover: glass
+   surfaces, sidebar/menu layout, modal, SMS page. Ported from the reference
+   build's design system, trimmed to what this trimmed app actually uses.
+   ========================================================================== */
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.3; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.1); }
+}
+@keyframes fade-slide-in {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ---- Base ---- */
+html {
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+html, body {
+  height: 100%;
+  margin: 0;
+}
+body {
+  background: #f9fafb;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+html.dark body {
+  background: #101014;
+}
+#root {
+  font-feature-settings: "tnum" 1, "cv01" 1;
+}
+
+.panel-boot-loader {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #f9fafb;
+}
+.dark .panel-boot-loader { background: #101014; }
+.panel-boot-logo {
+  display: block;
+  width: clamp(72px, 12vw, 120px);
+  height: clamp(72px, 12vw, 120px);
+  border-radius: 1.25rem;
+}
+
+::selection {
+  background: rgb(14 165 233 / 1);
+  color: #fff;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+.dark ::-webkit-scrollbar-thumb { background: #334155; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+.dark ::-webkit-scrollbar-thumb:hover { background: #475569; }
+
+/* ---- Design tokens ---- */
+:root {
+  --color-primary: #2563eb;
+  --color-surface: #ffffff;
+  --color-border: #e5e7eb;
+
+  /* Flat UI: solid fills, 1px borders, no blur, no shadows. */
+  --ui-surface: #ffffff;
+  --ui-surface-strong: #ffffff;
+  --ui-surface-muted: #ffffff;
+  --ui-border: #e2e8f0;
+  --ui-border-muted: #e2e8f0;
+  --ui-backdrop: none;
+  --ui-radius-sm: 4px;
+  --ui-radius-md: 4px;
+  --ui-radius-lg: 6px;
+  --ui-radius-xl: 6px;
+  --ui-shadow-sm: none;
+  --ui-shadow-md: none;
+  --ui-shadow-lg: none;
+  --ui-btn-shadow: none;
+  --ui-btn-shadow-hover: none;
+  --ui-btn-primary-shadow: none;
+  --ui-btn-primary-shadow-hover: none;
+}
+html.dark {
+  --color-primary: #3b82f6;
+  --color-surface: #1a1a20;
+  --color-border: rgba(255, 255, 255, 0.1);
+
+  --ui-surface: #17171c;
+  --ui-surface-strong: #1d1d23;
+  --ui-surface-muted: #17171c;
+  --ui-border: rgba(255, 255, 255, 0.1);
+  --ui-border-muted: rgba(255, 255, 255, 0.1);
+}
+
+/* ---- Surfaces ---- */
+.ui-surface {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  -webkit-backdrop-filter: var(--ui-backdrop);
+  backdrop-filter: var(--ui-backdrop);
+}
+.ui-surface-strong {
+  background: var(--ui-surface-strong);
+  border: 1px solid var(--ui-border);
+  -webkit-backdrop-filter: var(--ui-backdrop);
+  backdrop-filter: var(--ui-backdrop);
+}
+.ui-surface-muted {
+  background: var(--ui-surface-muted);
+  border: 1px solid var(--ui-border-muted);
+  -webkit-backdrop-filter: var(--ui-backdrop);
+  backdrop-filter: var(--ui-backdrop);
+}
+.ui-glass {
+  background: var(--ui-surface);
+  -webkit-backdrop-filter: var(--ui-backdrop);
+  backdrop-filter: var(--ui-backdrop);
+}
+.ui-glass-border {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  -webkit-backdrop-filter: var(--ui-backdrop);
+  backdrop-filter: var(--ui-backdrop);
+}
+.ui-card {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  -webkit-backdrop-filter: var(--ui-backdrop);
+  backdrop-filter: var(--ui-backdrop);
+  border-radius: var(--ui-radius-xl);
+  box-shadow: var(--ui-shadow-md);
+}
+.ui-card-hover {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.ui-card-hover:hover {
+  border-color: var(--color-primary);
+}
+.ui-panel {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  -webkit-backdrop-filter: var(--ui-backdrop);
+  backdrop-filter: var(--ui-backdrop);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow-sm);
+}
+.ui-panel-muted {
+  background: var(--ui-surface-muted);
+  border: 1px solid var(--ui-border-muted);
+  -webkit-backdrop-filter: var(--ui-backdrop);
+  backdrop-filter: var(--ui-backdrop);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow-sm);
+}
+.ui-action-btn { box-shadow: var(--ui-btn-shadow); }
+.ui-action-btn-primary { box-shadow: var(--ui-btn-primary-shadow); }
+.ui-action-btn-primary:hover,
+.ui-action-btn-primary:focus-visible { box-shadow: var(--ui-btn-primary-shadow-hover); }
+
+h1, h2, .ui-app-title { letter-spacing: -0.02em; }
+
+.animate-pulse-slow { animation: pulse 8s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+/* ---- Sidebar ---- */
+.sidebar-shell {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --sidebar-menu-text: #475569;
+  --sidebar-menu-hover-bg: #f1f5f9;
+  --sidebar-menu-active-bg: #eff6ff;
+  --sidebar-menu-active-color: #1d4ed8;
+  --sidebar-menu-active-ring: #1d4ed8;
+}
+html.dark .sidebar-shell {
+  --sidebar-menu-text: rgba(255, 255, 255, 0.84);
+  --sidebar-menu-hover-bg: rgba(255, 255, 255, 0.06);
+  --sidebar-menu-active-bg: rgba(14, 165, 233, 0.12);
+  --sidebar-menu-active-color: #93c5fd;
+  --sidebar-menu-active-ring: #3b82f6;
+}
+.sidebar-brand-title {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  color: #1f2430;
+  white-space: nowrap;
+}
+html.dark .sidebar-brand-title { color: #f3f4f6; }
+.sidebar-brand-logo {
+  width: 1.75rem;
+  height: 1.75rem;
+  flex-shrink: 0;
+  display: block;
+}
+.sidebar-menu-label {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.sidebar-menu { display: flex; flex-direction: column; }
+.sidebar-menu .panel-menu-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 40px;
+  min-height: 40px;
+  margin: 2px 8px;
+  border-radius: 4px;
+  padding-left: 13px;
+  padding-right: 13px;
+  font-size: 0.94rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--sidebar-menu-text);
+  cursor: pointer;
+  text-decoration: none;
+  transition: background-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+}
+.sidebar-menu .panel-menu-item .panel-menu-icon {
+  margin-right: 8px;
+  font-size: 1.18rem;
+  width: 1.18rem;
+  height: 1.18rem;
+  display: inline-flex;
+  color: inherit;
+  flex-shrink: 0;
+}
+.sidebar-menu .panel-menu-item:hover { background: var(--sidebar-menu-hover-bg); }
+html.dark .sidebar-shell .sidebar-menu .panel-menu-item:not(.is-active) { color: rgba(236, 241, 252, 0.9); }
+.sidebar-menu .panel-menu-item.is-active {
+  background: var(--sidebar-menu-active-bg);
+  color: var(--sidebar-menu-active-color);
+  box-shadow: inset -2px 0 0 var(--sidebar-menu-active-ring);
+}
+.sidebar-menu.is-collapsed { align-items: center; }
+.sidebar-menu.is-collapsed .panel-menu-item {
+  width: 36px;
+  height: 36px;
+  min-height: 36px;
+  margin: 3px auto;
+  padding: 0;
+  justify-content: center;
+}
+.sidebar-menu.is-collapsed .panel-menu-item .panel-menu-icon { margin: 0; }
+.sidebar-menu.is-collapsed .panel-menu-item .sidebar-menu-label { display: none; }
+
+.main-inner { max-width: 100%; }
+@media (min-width: 768px) {
+  .main-inner { max-width: clamp(0px, calc(100vw - 232px), 80rem); }
+}
+
+/* ---- Modal (glass) ---- */
+.glass-modal {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+}
+html.dark .glass-modal {
+  background: #1d1d23;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* ---- SMS page ---- */
+.sms-page { container-type: inline-size; }
+.sms-main-layout { display: grid; grid-template-columns: minmax(0, 1fr); height: 100%; min-height: 0; }
+.sms-msg-wrapper { width: 100%; max-width: min(620px, 88%); }
+.sms-delete-trigger { width: 28px; height: 28px; padding: 0; }
+.sms-thread-row { position: relative; }
+.sms-thread-item-shell { transition: background-color 0.16s ease, border-color 0.16s ease; }
+.sms-thread-item-shell-active {
+  background: color-mix(in srgb, var(--color-primary, #2563eb) 10%, transparent);
+  position: relative; z-index: 1;
+}
+.sms-thread-item-shell-active::before {
+  content: ""; position: absolute; left: 0; right: 0; top: -1px; height: 1px;
+  background: color-mix(in srgb, var(--color-primary, #2563eb) 10%, transparent);
+}
+.sms-thread-row-active { background: transparent; }
+.sms-thread-delete-btn { position: absolute; right: 16px; top: 50%; transform: translate(10px, -50%); z-index: 3; }
+.sms-thread-meta { transition: transform 0.2s ease; }
+.sms-message-delete-btn { flex: 0 0 auto; }
+.sms-delete-visible { opacity: 1 !important; pointer-events: auto !important; }
+.sms-action-sheet-mask {
+  position: fixed; inset: 0; z-index: 2200; background: rgba(15, 23, 42, 0.36);
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.sms-action-sheet {
+  width: min(520px, 100%);
+  background: var(--color-surface, #fff);
+  border-top-left-radius: 8px; border-top-right-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--color-border, #e5e7eb) 90%, transparent);
+  border-bottom: none;
+  padding: 12px; display: flex; flex-direction: column; gap: 10px;
+}
+.sms-action-sheet-title { font-size: 12px; font-weight: 700; color: #6b7280; text-align: center; letter-spacing: 0.03em; }
+.sms-danger-ghost-btn { color: #b91c1c; border-color: rgba(239,68,68,0.24); background: rgba(239,68,68,0.09); }
+.sms-danger-ghost-btn:hover { color: #991b1b; border-color: rgba(239,68,68,0.38); background: rgba(239,68,68,0.15); }
+@container (min-width: 980px) {
+  .sms-main-layout { grid-template-columns: 260px 340px minmax(0, 1fr); }
+  .sms-delete-trigger { opacity: 0; pointer-events: none; transition: opacity 0.18s ease, transform 0.2s ease; }
+  .group:hover .sms-delete-trigger, .group:focus-within .sms-delete-trigger { opacity: 1; pointer-events: auto; }
+  .sms-thread-row:hover .sms-thread-meta, .sms-thread-row:focus-within .sms-thread-meta { transform: translate(-36px); }
+  .sms-thread-row:hover .sms-thread-delete-btn, .sms-thread-row:focus-within .sms-thread-delete-btn { transform: translateY(-50%); }
+}
+@container (max-width: 979px) {
+  .sms-msg-wrapper { max-width: 96%; }
+}
+.sms-detail-scroll::-webkit-scrollbar { width: 6px; }
+.sms-detail-scroll::-webkit-scrollbar-track { background: transparent; }
+.sms-detail-scroll::-webkit-scrollbar-thumb { background: rgba(144,147,153,0.3); border-radius: 3px; }
+.sms-detail-scroll::-webkit-scrollbar-thumb:hover { background: rgba(144,147,153,0.5); }
+.sms-detail-scroll { scrollbar-width: thin; scrollbar-color: rgba(144,147,153,0.3) transparent; }
+
+/* ---- Mobile bottom tab bar ---- */
+.bottom-tabbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+  display: flex; height: 56px;
+  background: var(--ui-surface-strong);
+  border-top: 1px solid var(--ui-border);
+  padding-bottom: env(safe-area-inset-bottom);
+  box-sizing: content-box;
+}
+.bottom-tabbar a {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  font-size: 11px; color: #64748b; text-decoration: none;
+}
+.bottom-tabbar a svg { width: 20px; height: 20px; }
+.bottom-tabbar a.is-active { color: var(--sidebar-menu-active-color, #1d4ed8); font-weight: 600; }
+html.dark .bottom-tabbar a { color: #94a3b8; }
+html.dark .bottom-tabbar a.is-active { color: #93c5fd; }
+
+/* ---- Flat override: neutralise Tailwind shadow / blur utilities ---- */
+*, ::before, ::after {
+  --tw-shadow: 0 0 #0000 !important;
+  --tw-shadow-colored: 0 0 #0000 !important;
+}
+[class*="backdrop-blur"] {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+/* ---- Flat card header for legacy ui-panel-muted blocks (title as first child) ---- */
+.ui-panel-muted > div.text-sm.font-bold:first-child {
+  font-size: 12px;
+  line-height: 1.25rem;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--ui-border);
+}
+.sidebar-menu .panel-menu-item { font-size: 0.8125rem; height: 36px; min-height: 36px; }
+.sidebar-brand-title { font-size: 0.95rem; }

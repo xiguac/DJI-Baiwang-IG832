@@ -1,0 +1,6 @@
+# Scripts that run on the module (busybox sh) must keep LF line endings,
+# even when checked out on Windows with core.autocrlf=true.
+*.sh                              text eol=lf
+module-panel/init.d-module-panel  text eol=lf
+module-panel/httpd.conf           text eol=lf
+module-panel/www/cgi-bin/api      text eol=lf
